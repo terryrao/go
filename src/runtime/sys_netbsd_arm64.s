@@ -115,7 +115,7 @@ TEXT runtime·exit(SB),NOSPLIT,$-8
 	MOVD	$0, R0			// If we're still running,
 	MOVD	R0, (R0)		// crash
 
-// func exitThread(wait *uint32)
+// func exitThread(wait *atomic.Uint32)
 TEXT runtime·exitThread(SB),NOSPLIT,$0-8
 	MOVD	wait+0(FP), R0
 	// We're done using the stack.
@@ -317,14 +317,9 @@ TEXT runtime·sigtramp(SB),NOSPLIT|TOPFRAME,$176
 	BEQ	2(PC)
 	BL	runtime·load_g(SB)
 
-#ifdef GOEXPERIMENT_regabiargs
 	// Restore signum to R0.
 	MOVW	8(RSP), R0
 	// R1 and R2 already contain info and ctx, respectively.
-#else
-	MOVD	R1, 16(RSP)
-	MOVD	R2, 24(RSP)
-#endif
 	BL	runtime·sigtrampgo<ABIInternal>(SB)
 
 	// Restore callee-save registers.

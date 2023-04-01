@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"go/constant"
 	"go/token"
+	"internal/types/errors"
 	"math"
 	"math/big"
 	"strings"
@@ -34,10 +35,7 @@ func roundFloat(v constant.Value, sz int64) constant.Value {
 // truncate float literal fv to 32-bit or 64-bit precision
 // according to type; return truncated value.
 func truncfltlit(v constant.Value, t *types.Type) constant.Value {
-	if t.IsUntyped() || overflow(v, t) {
-		// If there was overflow, simply continuing would set the
-		// value to Inf which in turn would lead to spurious follow-on
-		// errors. Avoid this by returning the existing value.
+	if t.IsUntyped() {
 		return v
 	}
 
@@ -48,10 +46,7 @@ func truncfltlit(v constant.Value, t *types.Type) constant.Value {
 // precision, according to type; return truncated value. In case of
 // overflow, calls Errorf but does not truncate the input value.
 func trunccmplxlit(v constant.Value, t *types.Type) constant.Value {
-	if t.IsUntyped() || overflow(v, t) {
-		// If there was overflow, simply continuing would set the
-		// value to Inf which in turn would lead to spurious follow-on
-		// errors. Avoid this by returning the existing value.
+	if t.IsUntyped() {
 		return v
 	}
 
@@ -251,7 +246,6 @@ func convertVal(v constant.Value, t *types.Type, explicit bool) constant.Value {
 		switch {
 		case t.IsInteger():
 			v = toint(v)
-			overflow(v, t)
 			return v
 		case t.IsFloat():
 			v = toflt(v)
@@ -273,9 +267,6 @@ func tocplx(v constant.Value) constant.Value {
 
 func toflt(v constant.Value) constant.Value {
 	if v.Kind() == constant.Complex {
-		if constant.Sign(constant.Imag(v)) != 0 {
-			base.Errorf("constant %v truncated to real", v)
-		}
 		v = constant.Real(v)
 	}
 
@@ -284,9 +275,6 @@ func toflt(v constant.Value) constant.Value {
 
 func toint(v constant.Value) constant.Value {
 	if v.Kind() == constant.Complex {
-		if constant.Sign(constant.Imag(v)) != 0 {
-			base.Errorf("constant %v truncated to integer", v)
-		}
 		v = constant.Real(v)
 	}
 
@@ -319,25 +307,6 @@ func toint(v constant.Value) constant.Value {
 	// Prevent follow-on errors.
 	// TODO(mdempsky): Use constant.MakeUnknown() instead.
 	return constant.MakeInt64(1)
-}
-
-// overflow reports whether constant value v is too large
-// to represent with type t, and emits an error message if so.
-func overflow(v constant.Value, t *types.Type) bool {
-	// v has already been converted
-	// to appropriate form for t.
-	if t.IsUntyped() {
-		return false
-	}
-	if v.Kind() == constant.Int && constant.BitLen(v) > ir.ConstPrec {
-		base.Errorf("integer too large")
-		return true
-	}
-	if ir.ConstOverflow(v, t) {
-		base.Errorf("constant %v overflows %v", types.FmtConst(v, false), t)
-		return true
-	}
-	return false
 }
 
 func tostr(v constant.Value) constant.Value {
@@ -599,7 +568,7 @@ func OrigConst(n ir.Node, v constant.Value) ir.Node {
 		if what == "" {
 			base.Fatalf("unexpected overflow: %v", n.Op())
 		}
-		base.ErrorfAt(n.Pos(), "constant %v overflow", what)
+		base.ErrorfAt(n.Pos(), errors.NumericOverflow, "constant %v overflow", what)
 		n.SetType(nil)
 		return n
 	}
@@ -743,6 +712,7 @@ func callOrChan(n ir.Node) bool {
 		ir.OCALLINTER,
 		ir.OCALLMETH,
 		ir.OCAP,
+		ir.OCLEAR,
 		ir.OCLOSE,
 		ir.OCOMPLEX,
 		ir.OCOPY,
@@ -758,7 +728,10 @@ func callOrChan(n ir.Node) bool {
 		ir.ORECOVER,
 		ir.ORECV,
 		ir.OUNSAFEADD,
-		ir.OUNSAFESLICE:
+		ir.OUNSAFESLICE,
+		ir.OUNSAFESLICEDATA,
+		ir.OUNSAFESTRING,
+		ir.OUNSAFESTRINGDATA:
 		return true
 	}
 	return false

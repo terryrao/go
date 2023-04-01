@@ -20,7 +20,7 @@ import (
 	"cmd/internal/obj/x86"
 )
 
-// markMoves marks any MOVXconst ops that need to avoid clobbering flags.
+// ssaMarkMoves marks any MOVXconst ops that need to avoid clobbering flags.
 func ssaMarkMoves(s *ssagen.State, b *ssa.Block) {
 	flive := b.FlagsLiveAtEnd
 	for _, c := range b.ControlValues() {
@@ -30,7 +30,7 @@ func ssaMarkMoves(s *ssagen.State, b *ssa.Block) {
 		v := b.Values[i]
 		if flive && (v.Op == ssa.OpAMD64MOVLconst || v.Op == ssa.OpAMD64MOVQconst) {
 			// The "mark" is any non-nil Aux value.
-			v.Aux = v
+			v.Aux = ssa.AuxMark
 		}
 		if v.Type.IsFlags() {
 			flive = false
@@ -78,6 +78,8 @@ func storeByType(t *types.Type) obj.As {
 			return x86.AMOVL
 		case 8:
 			return x86.AMOVQ
+		case 16:
+			return x86.AMOVUPS
 		}
 	}
 	panic(fmt.Sprintf("bad store type %v", t))
@@ -272,7 +274,12 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p.From.Type = obj.TYPE_REG
 		p.From.Reg = v.Args[0].Reg()
 		p.To.Type = obj.TYPE_REG
-		p.To.Reg = v.Reg()
+		switch v.Op {
+		case ssa.OpAMD64BLSRQ, ssa.OpAMD64BLSRL:
+			p.To.Reg = v.Reg0()
+		default:
+			p.To.Reg = v.Reg()
+		}
 
 	case ssa.OpAMD64ANDNQ, ssa.OpAMD64ANDNL:
 		p := s.Prog(v.Op.Asm())
@@ -598,23 +605,23 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 	case ssa.OpAMD64CMOVQEQF, ssa.OpAMD64CMOVLEQF, ssa.OpAMD64CMOVWEQF:
 		// Flag condition: ZERO && !PARITY
 		// Generate:
-		//   MOV      SRC,AX
-		//   CMOV*NE  DST,AX
-		//   CMOV*PC  AX,DST
+		//   MOV      SRC,TMP
+		//   CMOV*NE  DST,TMP
+		//   CMOV*PC  TMP,DST
 		//
 		// TODO(rasky): we could generate:
 		//   CMOV*NE  DST,SRC
 		//   CMOV*PC  SRC,DST
 		// But this requires a way for regalloc to know that SRC might be
 		// clobbered by this instruction.
-		if v.Args[1].Reg() != x86.REG_AX {
-			opregreg(s, moveByType(v.Type), x86.REG_AX, v.Args[1].Reg())
-		}
+		t := v.RegTmp()
+		opregreg(s, moveByType(v.Type), t, v.Args[1].Reg())
+
 		p := s.Prog(v.Op.Asm())
 		p.From.Type = obj.TYPE_REG
 		p.From.Reg = v.Reg()
 		p.To.Type = obj.TYPE_REG
-		p.To.Reg = x86.REG_AX
+		p.To.Reg = t
 		var q *obj.Prog
 		if v.Op == ssa.OpAMD64CMOVQEQF {
 			q = s.Prog(x86.ACMOVQPC)
@@ -624,7 +631,7 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 			q = s.Prog(x86.ACMOVWPC)
 		}
 		q.From.Type = obj.TYPE_REG
-		q.From.Reg = x86.REG_AX
+		q.From.Reg = t
 		q.To.Type = obj.TYPE_REG
 		q.To.Reg = v.Reg()
 
@@ -1109,8 +1116,8 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		p := s.Prog(obj.ACALL)
 		p.To.Type = obj.TYPE_MEM
 		p.To.Name = obj.NAME_EXTERN
-		// arg0 is in DI. Set sym to match where regalloc put arg1.
-		p.To.Sym = ssagen.GCWriteBarrierReg[v.Args[1].Reg()]
+		// AuxInt encodes how many buffer entries we need.
+		p.To.Sym = ir.Syms.GCWriteBarrier[v.AuxInt-1]
 
 	case ssa.OpAMD64LoweredPanicBoundsA, ssa.OpAMD64LoweredPanicBoundsB, ssa.OpAMD64LoweredPanicBoundsC:
 		p := s.Prog(obj.ACALL)
@@ -1192,24 +1199,26 @@ func ssaGenValue(s *ssagen.State, v *ssa.Value) {
 		ssagen.AddAux(&p.To, v)
 
 	case ssa.OpAMD64SETNEF:
+		t := v.RegTmp()
 		p := s.Prog(v.Op.Asm())
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = v.Reg()
 		q := s.Prog(x86.ASETPS)
 		q.To.Type = obj.TYPE_REG
-		q.To.Reg = x86.REG_AX
+		q.To.Reg = t
 		// ORL avoids partial register write and is smaller than ORQ, used by old compiler
-		opregreg(s, x86.AORL, v.Reg(), x86.REG_AX)
+		opregreg(s, x86.AORL, v.Reg(), t)
 
 	case ssa.OpAMD64SETEQF:
+		t := v.RegTmp()
 		p := s.Prog(v.Op.Asm())
 		p.To.Type = obj.TYPE_REG
 		p.To.Reg = v.Reg()
 		q := s.Prog(x86.ASETPC)
 		q.To.Type = obj.TYPE_REG
-		q.To.Reg = x86.REG_AX
+		q.To.Reg = t
 		// ANDL avoids partial register write and is smaller than ANDQ, used by old compiler
-		opregreg(s, x86.AANDL, v.Reg(), x86.REG_AX)
+		opregreg(s, x86.AANDL, v.Reg(), t)
 
 	case ssa.OpAMD64InvertFlags:
 		v.Fatalf("InvertFlags should never make it to codegen %v", v.LongString())

@@ -52,7 +52,7 @@ call:
 // manipulating the return address so that libfuzzer's integer compare hooks
 // work
 // libFuzzer's compare hooks obtain the caller's address from the compiler
-// builtin __builtin_return_adress. Since we invoke the hooks always
+// builtin __builtin_return_address. Since we invoke the hooks always
 // from the same native function, this builtin would always return the same
 // value. Internally, the libFuzzer hooks call through to the always inlined
 // HandleCmp and thus can't be mimicked without patching libFuzzer.
@@ -100,7 +100,7 @@ call:
 	PUSHQ   BX
 	// Load the starting address of the return sled into BX.
 	MOVQ    $ret_sled<>(SB), BX
-	// Load the address of the i'th return instruction fron the return sled.
+	// Load the address of the i'th return instruction from the return sled.
 	// The index is given in the fakePC argument.
 	ADDQ    R8, BX
 	PUSHQ   BX
@@ -108,7 +108,7 @@ call:
 	// Function arguments arg0 and arg1 are passed in the registers specified
 	// by the x64 calling convention.
 	JMP     AX
-// This code will not be executed and is only there to statisfy assembler
+// This code will not be executed and is only there to satisfy assembler
 // check of a balanced stack.
 not_reachable:
 	POPQ    BX

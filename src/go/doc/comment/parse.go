@@ -326,6 +326,13 @@ func (p *Parser) Parse(text string) *Doc {
 		switch b := b.(type) {
 		case *Paragraph:
 			b.Text = d.parseLinkedText(string(b.Text[0].(Plain)))
+		case *List:
+			for _, i := range b.Items {
+				for _, c := range i.Content {
+					p := c.(*Paragraph)
+					p.Text = d.parseLinkedText(string(p.Text[0].(Plain)))
+				}
+			}
 		}
 	}
 
@@ -844,9 +851,7 @@ func (d *parseDoc) docLink(text, before, after string) (link *DocLink, ok bool) 
 			return nil, false
 		}
 	}
-	if strings.HasPrefix(text, "*") {
-		text = text[1:]
-	}
+	text = strings.TrimPrefix(text, "*")
 	pkg, name, ok := splitDocName(text)
 	var recv string
 	if ok {

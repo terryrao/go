@@ -29,3 +29,6 @@ func TestWithValueChecksKey(t *testing.T)              { XTestWithValueChecksKey
 func TestInvalidDerivedFail(t *testing.T)              { XTestInvalidDerivedFail(t) }
 func TestDeadlineExceededSupportsTimeout(t *testing.T) { XTestDeadlineExceededSupportsTimeout(t) }
 func TestCustomContextGoroutines(t *testing.T)         { XTestCustomContextGoroutines(t) }
+func TestCause(t *testing.T)                           { XTestCause(t) }
+func TestCauseRace(t *testing.T)                       { XTestCauseRace(t) }
+func TestWithoutCancel(t *testing.T)                   { XTestWithoutCancel(t) }

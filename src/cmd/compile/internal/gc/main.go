@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/coverage"
 	"cmd/compile/internal/deadcode"
 	"cmd/compile/internal/devirtualize"
 	"cmd/compile/internal/dwarfgen"
@@ -15,11 +16,14 @@ import (
 	"cmd/compile/internal/inline"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/logopt"
+	"cmd/compile/internal/loopvar"
 	"cmd/compile/internal/noder"
+	"cmd/compile/internal/pgo"
 	"cmd/compile/internal/pkginit"
 	"cmd/compile/internal/reflectdata"
 	"cmd/compile/internal/ssa"
 	"cmd/compile/internal/ssagen"
+	"cmd/compile/internal/staticinit"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/internal/dwarf"
@@ -73,16 +77,17 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	base.DebugSSA = ssa.PhaseOption
 	base.ParseFlags()
 
-	types.LocalPkg = types.NewPkg(base.Ctxt.Pkgpath, "")
+	if os.Getenv("GOGC") == "" { // GOGC set disables starting heap adjustment
+		// More processors will use more heap, but assume that more memory is available.
+		// So 1 processor -> 40MB, 4 -> 64MB, 12 -> 128MB
+		base.AdjustStartingHeap(uint64(32+8*base.Flag.LowerC) << 20)
+	}
 
-	// We won't know localpkg's height until after import
-	// processing. In the mean time, set to MaxPkgHeight to ensure
-	// height comparisons at least work until then.
-	types.LocalPkg.Height = types.MaxPkgHeight
+	types.LocalPkg = types.NewPkg(base.Ctxt.Pkgpath, "")
 
 	// pseudo-package, for scoping
 	types.BuiltinPkg = types.NewPkg("go.builtin", "") // TODO(gri) name this package go.builtin?
-	types.BuiltinPkg.Prefix = "go.builtin"            // not go%2ebuiltin
+	types.BuiltinPkg.Prefix = "go:builtin"
 
 	// pseudo-package, accessed by import "unsafe"
 	types.UnsafePkg = types.NewPkg("unsafe", "unsafe")
@@ -97,10 +102,14 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 
 	// pseudo-packages used in symbol tables
 	ir.Pkgs.Itab = types.NewPkg("go.itab", "go.itab")
-	ir.Pkgs.Itab.Prefix = "go.itab" // not go%2eitab
+	ir.Pkgs.Itab.Prefix = "go:itab"
 
 	// pseudo-package used for methods with anonymous receivers
 	ir.Pkgs.Go = types.NewPkg("go", "")
+
+	// pseudo-package for use with code coverage instrumentation.
+	ir.Pkgs.Coverage = types.NewPkg("go.coverage", "runtime/coverage")
+	ir.Pkgs.Coverage.Prefix = "runtime/coverage"
 
 	// Record flags that affect the build result. (And don't
 	// record flags that don't, since that would cause spurious
@@ -203,6 +212,12 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// because it generates itabs for initializing global variables.
 	ssagen.InitConfig()
 
+	// First part of coverage fixup (if applicable).
+	var cnames coverage.Names
+	if base.Flag.Cfg.CoverageInfo != nil {
+		cnames = coverage.FixupVars()
+	}
+
 	// Create "init" function for package-scope variable initialization
 	// statements, if any.
 	//
@@ -211,6 +226,12 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	// carried out in, and even mundane optimizations like dead code
 	// removal can skew the results (e.g., #43444).
 	pkginit.MakeInit()
+
+	// Second part of code coverage fixup (init func modification),
+	// if applicable.
+	if base.Flag.Cfg.CoverageInfo != nil {
+		coverage.FixupInit(cnames)
+	}
 
 	// Eliminate some obviously dead code.
 	// Must happen after typechecking.
@@ -231,23 +252,30 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	}
 	typecheck.IncrementalAddrtaken = true
 
-	if base.Debug.TypecheckInl != 0 {
-		// Typecheck imported function bodies if Debug.l > 1,
-		// otherwise lazily when used or re-exported.
-		typecheck.AllImportedBodies()
+	// Read profile file and build profile-graph and weighted-call-graph.
+	base.Timer.Start("fe", "pgoprofile")
+	var profile *pgo.Profile
+	if base.Flag.PgoProfile != "" {
+		var err error
+		profile, err = pgo.New(base.Flag.PgoProfile)
+		if err != nil {
+			log.Fatalf("%s: PGO error: %v", base.Flag.PgoProfile, err)
+		}
 	}
 
 	// Inlining
 	base.Timer.Start("fe", "inlining")
 	if base.Flag.LowerL != 0 {
-		inline.InlinePackage()
+		inline.InlinePackage(profile)
 	}
 	noder.MakeWrappers(typecheck.Target) // must happen after inlining
 
-	// Devirtualize.
+	// Devirtualize and get variable capture right in for loops
+	var transformed []*ir.Name
 	for _, n := range typecheck.Target.Decls {
 		if n.Op() == ir.ODCLFUNC {
 			devirtualize.Func(n.(*ir.Func))
+			transformed = append(transformed, loopvar.ForCapture(n.(*ir.Func))...)
 		}
 	}
 	ir.CurFunc = nil
@@ -272,10 +300,45 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	base.Timer.Start("fe", "escapes")
 	escape.Funcs(typecheck.Target.Decls)
 
-	// TODO(mdempsky): This is a hack. We need a proper, global work
-	// queue for scheduling function compilation so components don't
-	// need to adjust their behavior depending on when they're called.
-	reflectdata.AfterGlobalEscapeAnalysis = true
+	if 2 <= base.Debug.LoopVar && base.Debug.LoopVar != 11 || logopt.Enabled() { // 11 is do them all, quietly, 12 includes debugging.
+		fileToPosBase := make(map[string]*src.PosBase) // used to remove inline context for innermost reporting.
+		for _, n := range transformed {
+			pos := n.Pos()
+			if logopt.Enabled() {
+				// For automated checking of coverage of this transformation, include this in the JSON information.
+				if n.Esc() == ir.EscHeap {
+					logopt.LogOpt(pos, "transform-escape", "loopvar", ir.FuncName(n.Curfn))
+				} else {
+					logopt.LogOpt(pos, "transform-noescape", "loopvar", ir.FuncName(n.Curfn))
+				}
+			}
+			inner := base.Ctxt.InnermostPos(pos)
+			outer := base.Ctxt.OutermostPos(pos)
+			if inner == outer {
+				if n.Esc() == ir.EscHeap {
+					base.WarnfAt(pos, "transformed loop variable %v escapes", n)
+				} else {
+					base.WarnfAt(pos, "transformed loop variable %v does not escape", n)
+				}
+			} else {
+				// Report the problem at the line where it actually occurred.
+				afn := inner.AbsFilename()
+				pb, ok := fileToPosBase[afn]
+				if !ok {
+					pb = src.NewFileBase(inner.Filename(), afn)
+					fileToPosBase[afn] = pb
+				}
+				inner.SetBase(pb) // rebasing w/o inline context makes it print correctly in WarnfAt; otherwise it prints as outer.
+				innerXPos := base.Ctxt.PosTable.XPos(inner)
+
+				if n.Esc() == ir.EscHeap {
+					base.WarnfAt(innerXPos, "transformed loop variable %v escapes (loop inlined into %s:%d)", n, outer.Filename(), outer.Line())
+				} else {
+					base.WarnfAt(innerXPos, "transformed loop variable %v does not escape (loop inlined into %s:%d)", n, outer.Filename(), outer.Line())
+				}
+			}
+		}
+	}
 
 	// Collect information for go:nowritebarrierrec
 	// checking. This must happen before transforming closures during Walk
@@ -308,6 +371,11 @@ func Main(archInit func(*ssagen.ArchInfo)) {
 	if base.Flag.CompilingRuntime {
 		// Write barriers are now known. Check the call graph.
 		ssagen.NoWriteBarrierRecCheck()
+	}
+
+	// Add keep relocations for global maps.
+	if base.Debug.WrapGlobalMapCtl != 1 {
+		staticinit.AddKeepRelocations()
 	}
 
 	// Finalize DWARF inline routine DIEs, then explicitly turn off

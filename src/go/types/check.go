@@ -12,17 +12,14 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/token"
+	. "internal/types/errors"
 )
+
+// nopos indicates an unknown position
+var nopos token.Pos
 
 // debugging/development support
-const (
-	debug = false // leave on during development
-	trace = false // turn on for detailed type resolution traces
-
-	// TODO(rfindley): add compiler error message handling from types2, guarded
-	// behind this flag, so that we can keep the code in sync.
-	compilerErrorMessages = false // match compiler error messages
-)
+const debug = false // leave on during development
 
 // exprInfo stores information about an untyped expression.
 type exprInfo struct {
@@ -275,7 +272,7 @@ func (check *Checker) initFiles(files []*ast.File) {
 			if name != "_" {
 				pkg.name = name
 			} else {
-				check.errorf(file.Name, _BlankPkgName, "invalid package name _")
+				check.error(file.Name, BlankPkgName, "invalid package name _")
 			}
 			fallthrough
 
@@ -283,7 +280,7 @@ func (check *Checker) initFiles(files []*ast.File) {
 			check.files = append(check.files, file)
 
 		default:
-			check.errorf(atPos(file.Package), _MismatchedPkgName, "package %s; expected %s", name, pkg.name)
+			check.errorf(atPos(file.Package), MismatchedPkgName, "package %s; expected %s", name, pkg.name)
 			// ignore this file
 		}
 	}
@@ -316,7 +313,7 @@ func (check *Checker) checkFiles(files []*ast.File) (err error) {
 	defer check.handleBailout(&err)
 
 	print := func(msg string) {
-		if trace {
+		if check.conf._Trace {
 			fmt.Println()
 			fmt.Println(msg)
 		}
@@ -380,15 +377,15 @@ func (check *Checker) processDelayed(top int) {
 	// this is a sufficiently bounded process.
 	for i := top; i < len(check.delayed); i++ {
 		a := &check.delayed[i]
-		if trace {
+		if check.conf._Trace {
 			if a.desc != nil {
 				check.trace(a.desc.pos.Pos(), "-- "+a.desc.format, a.desc.args...)
 			} else {
-				check.trace(token.NoPos, "-- delayed %p", a.f)
+				check.trace(nopos, "-- delayed %p", a.f)
 			}
 		}
 		a.f() // may append to check.delayed
-		if trace {
+		if check.conf._Trace {
 			fmt.Println()
 		}
 	}
@@ -481,20 +478,24 @@ func (check *Checker) recordBuiltinType(f ast.Expr, sig *Signature) {
 	}
 }
 
-func (check *Checker) recordCommaOkTypes(x ast.Expr, a [2]Type) {
+// recordCommaOkTypes updates recorded types to reflect that x is used in a commaOk context
+// (and therefore has tuple type).
+func (check *Checker) recordCommaOkTypes(x ast.Expr, a []*operand) {
 	assert(x != nil)
-	if a[0] == nil || a[1] == nil {
+	assert(len(a) == 2)
+	if a[0].mode == invalid {
 		return
 	}
-	assert(isTyped(a[0]) && isTyped(a[1]) && (isBoolean(a[1]) || a[1] == universeError))
+	t0, t1 := a[0].typ, a[1].typ
+	assert(isTyped(t0) && isTyped(t1) && (isBoolean(t1) || t1 == universeError))
 	if m := check.Types; m != nil {
 		for {
 			tv := m[x]
 			assert(tv.Type != nil) // should have been recorded already
 			pos := x.Pos()
 			tv.Type = NewTuple(
-				NewVar(pos, check.pkg, "", a[0]),
-				NewVar(pos, check.pkg, "", a[1]),
+				NewVar(pos, check.pkg, "", t0),
+				NewVar(pos, check.pkg, "", t1),
 			)
 			m[x] = tv
 			// if x is a parenthesized expression (p.X), update p.X

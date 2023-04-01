@@ -152,8 +152,8 @@ func readTrace(r io.Reader) (ver int, events []rawEvent, strings map[uint64]stri
 	}
 	switch ver {
 	case 1005, 1007, 1008, 1009, 1010, 1011, 1019:
-		// Note: When adding a new version, add canned traces
-		// from the old version to the test suite using mkcanned.bash.
+		// Note: When adding a new version, confirm that canned traces from the
+		// old version are part of the test suite. Add them using mkcanned.bash.
 		break
 	default:
 		err = fmt.Errorf("unsupported trace file version %v.%v (update Go toolchain) %v", ver/1000, ver%1000, ver)
@@ -973,7 +973,7 @@ func PrintEvent(ev *Event) {
 
 func (ev *Event) String() string {
 	desc := EventDescriptions[ev.Type]
-	w := new(bytes.Buffer)
+	w := new(strings.Builder)
 	fmt.Fprintf(w, "%v %v p=%v g=%v off=%v", ev.Ts, desc.Name, ev.P, ev.G, ev.Off)
 	for i, a := range desc.Args {
 		fmt.Fprintf(w, " %v=%v", a, ev.Args[i])
@@ -1074,11 +1074,11 @@ const (
 	EvGoBlockGC         = 42 // goroutine blocks on GC assist [timestamp, stack]
 	EvGCMarkAssistStart = 43 // GC mark assist start [timestamp, stack]
 	EvGCMarkAssistDone  = 44 // GC mark assist done [timestamp]
-	EvUserTaskCreate    = 45 // trace.NewContext [timestamp, internal task id, internal parent id, stack, name string]
+	EvUserTaskCreate    = 45 // trace.NewTask [timestamp, internal task id, internal parent id, name string, stack]
 	EvUserTaskEnd       = 46 // end of task [timestamp, internal task id, stack]
-	EvUserRegion        = 47 // trace.WithRegion [timestamp, internal task id, mode(0:start, 1:end), stack, name string]
+	EvUserRegion        = 47 // trace.WithRegion [timestamp, internal task id, mode(0:start, 1:end), name string, stack]
 	EvUserLog           = 48 // trace.Log [timestamp, internal id, key string id, stack, value string]
-	EvCPUSample         = 49 // CPU profiling sample [timestamp, stack, real timestamp, real P id (-1 when absent), goroutine id]
+	EvCPUSample         = 49 // CPU profiling sample [timestamp, real timestamp, real P id (-1 when absent), goroutine id, stack]
 	EvCount             = 50
 )
 

@@ -14,6 +14,7 @@ import (
 	"cmd/link/internal/sym"
 	"debug/elf"
 	"fmt"
+	"io"
 	"log"
 	"math/bits"
 	"os"
@@ -721,9 +722,9 @@ func (l *Loader) checkdup(name string, r *oReader, li uint32, dup Sym) {
 	// here is that we get different line numbers on formal
 	// params; I am guessing that the pos is being inherited
 	// from the spot where the wrapper is needed.
-	allowed := strings.HasPrefix(name, "go.info.go.interface") ||
-		strings.HasPrefix(name, "go.info.go.builtin") ||
-		strings.HasPrefix(name, "go.debuglines")
+	allowed := strings.HasPrefix(name, "go:info.go.interface") ||
+		strings.HasPrefix(name, "go:info.go.builtin") ||
+		strings.HasPrefix(name, "go:debuglines")
 	if !allowed {
 		l.strictDupMsgs++
 	}
@@ -1040,6 +1041,14 @@ func (l *Loader) SetAttrCgoExportDynamic(i Sym, v bool) {
 	}
 }
 
+// ForAllAttrCgoExportDynamic calls f for every symbol that has been
+// marked with the "cgo_export_dynamic" compiler directive.
+func (l *Loader) ForAllCgoExportDynamic(f func(Sym)) {
+	for s := range l.attrCgoExportDynamic {
+		f(s)
+	}
+}
+
 // AttrCgoExportStatic returns true for a symbol that has been
 // specially marked via the "cgo_export_static" directive
 // written by cgo.
@@ -1181,6 +1190,15 @@ func (l *Loader) IsDict(i Sym) bool {
 	return r.Sym(li).IsDict()
 }
 
+// Returns whether this symbol is a compiler-generated package init func.
+func (l *Loader) IsPkgInit(i Sym) bool {
+	if l.IsExternal(i) {
+		return false
+	}
+	r, li := l.toLocal(i)
+	return r.Sym(li).IsPkgInit()
+}
+
 // Return whether this is a trampoline of a deferreturn call.
 func (l *Loader) IsDeferReturnTramp(i Sym) bool {
 	return l.deferReturnTramp[i]
@@ -1272,7 +1290,7 @@ func (l *Loader) SetSymAlign(i Sym, align int32) {
 	l.align[i] = uint8(bits.Len32(uint32(align)))
 }
 
-// SymValue returns the section of the i-th symbol. i is global index.
+// SymSect returns the section of the i-th symbol. i is global index.
 func (l *Loader) SymSect(i Sym) *sym.Section {
 	if int(i) >= len(l.symSects) {
 		// symSects is extended lazily -- it the sym in question is
@@ -1311,7 +1329,7 @@ func (l *Loader) NewSection() *sym.Section {
 	return sect
 }
 
-// SymDynImplib returns the "dynimplib" attribute for the specified
+// SymDynimplib returns the "dynimplib" attribute for the specified
 // symbol, making up a portion of the info for a symbol specified
 // on a "cgo_import_dynamic" compiler directive.
 func (l *Loader) SymDynimplib(i Sym) string {
@@ -1494,7 +1512,7 @@ func (l *Loader) SetSymDynid(i Sym, val int32) {
 	}
 }
 
-// DynIdSyms returns the set of symbols for which dynID is set to an
+// DynidSyms returns the set of symbols for which dynID is set to an
 // interesting (non-default) value. This is expected to be a fairly
 // small set.
 func (l *Loader) DynidSyms() []Sym {
@@ -1561,13 +1579,12 @@ func (l *Loader) SetSymPkg(i Sym, pkg string) {
 	l.symPkg[i] = pkg
 }
 
-// SymLocalentry returns the "local entry" value for the specified
-// symbol.
+// SymLocalentry returns an offset in bytes of the "local entry" of a symbol.
 func (l *Loader) SymLocalentry(i Sym) uint8 {
 	return l.localentry[i]
 }
 
-// SetSymLocalentry sets the "local entry" attribute for a symbol.
+// SetSymLocalentry sets the "local entry" offset attribute for a symbol.
 func (l *Loader) SetSymLocalentry(i Sym, value uint8) {
 	// reject bad symbols
 	if i >= Sym(len(l.objSyms)) || i == 0 {
@@ -1601,6 +1618,29 @@ func (l *Loader) Aux(i Sym, j int) Aux {
 	return Aux{r.Aux(li, j), r, l}
 }
 
+// WasmImportSym returns the auxiliary WebAssembly import symbol associated with
+// a given function symbol. The aux sym only exists for Go function stubs that
+// have been annotated with the //go:wasmimport directive.  The aux sym
+// contains the information necessary for the linker to add a WebAssembly
+// import statement.
+// (https://webassembly.github.io/spec/core/syntax/modules.html#imports)
+func (l *Loader) WasmImportSym(fnSymIdx Sym) (Sym, bool) {
+	if l.SymType(fnSymIdx) != sym.STEXT {
+		log.Fatalf("error: non-function sym %d/%s t=%s passed to WasmImportSym", fnSymIdx, l.SymName(fnSymIdx), l.SymType(fnSymIdx).String())
+	}
+	r, li := l.toLocal(fnSymIdx)
+	auxs := r.Auxs(li)
+	for i := range auxs {
+		a := &auxs[i]
+		switch a.Type() {
+		case goobj.AuxWasmImport:
+			return l.resolve(r, a.Sym()), true
+		}
+	}
+
+	return 0, false
+}
+
 // GetFuncDwarfAuxSyms collects and returns the auxiliary DWARF
 // symbols associated with a given function symbol.  Prior to the
 // introduction of the loader, this was done purely using name
@@ -1610,13 +1650,8 @@ func (l *Loader) GetFuncDwarfAuxSyms(fnSymIdx Sym) (auxDwarfInfo, auxDwarfLoc, a
 	if l.SymType(fnSymIdx) != sym.STEXT {
 		log.Fatalf("error: non-function sym %d/%s t=%s passed to GetFuncDwarfAuxSyms", fnSymIdx, l.SymName(fnSymIdx), l.SymType(fnSymIdx).String())
 	}
-	if l.IsExternal(fnSymIdx) {
-		// Current expectation is that any external function will
-		// not have auxsyms.
-		return
-	}
-	r, li := l.toLocal(fnSymIdx)
-	auxs := r.Auxs(li)
+	r, auxs := l.auxs(fnSymIdx)
+
 	for i := range auxs {
 		a := &auxs[i]
 		switch a.Type() {
@@ -1703,7 +1738,7 @@ func (l *Loader) OuterSym(i Sym) Sym {
 // SubSym gets the subsymbol for host object loaded symbols.
 func (l *Loader) SubSym(i Sym) Sym {
 	// NB: note -- no check for l.isExternal(), since I am pretty sure
-	// that later phases in the linker set subsym for "type." syms
+	// that later phases in the linker set subsym for "type:" syms
 	return l.sub[i]
 }
 
@@ -1716,7 +1751,7 @@ func (l *Loader) SubSym(i Sym) Sym {
 // emits named string symbols (type SGOSTRING) when compiling a
 // package; after being deduplicated, these symbols are collected into
 // a single unit by assigning them a new carrier symbol named
-// "go.string.*" (which appears in the final symbol table for the
+// "go:string.*" (which appears in the final symbol table for the
 // output load module).
 func (l *Loader) SetCarrierSym(s Sym, c Sym) {
 	if c == 0 {
@@ -1833,7 +1868,7 @@ func (l *Loader) Relocs(i Sym) Relocs {
 	return l.relocs(r, li)
 }
 
-// Relocs returns a Relocs object given a local sym index and reader.
+// relocs returns a Relocs object given a local sym index and reader.
 func (l *Loader) relocs(r *oReader, li uint32) Relocs {
 	var rs []goobj.Reloc
 	if l.isExtReader(r) {
@@ -1963,6 +1998,10 @@ func (fi *FuncInfo) FuncFlag() objabi.FuncFlag {
 	return (*goobj.FuncInfo)(nil).ReadFuncFlag(fi.data)
 }
 
+func (fi *FuncInfo) StartLine() int32 {
+	return (*goobj.FuncInfo)(nil).ReadStartLine(fi.data)
+}
+
 // Preload has to be called prior to invoking the various methods
 // below related to pcdata, funcdataoff, files, and inltree nodes.
 func (fi *FuncInfo) Preload() {
@@ -2081,7 +2120,7 @@ func (l *Loader) Preload(localSymVersion int, f *bio.Reader, lib *sym.Library, u
 	l.addObj(lib.Pkg, or)
 
 	// The caller expects us consuming all the data
-	f.MustSeek(length, os.SEEK_CUR)
+	f.MustSeek(length, io.SeekCurrent)
 
 	return r.Fingerprint()
 }
@@ -2132,7 +2171,7 @@ func (st *loadState) preloadSyms(r *oReader, kind int) {
 			l.SetAttrUsedInIface(gi, true)
 		}
 		if strings.HasPrefix(name, "runtime.") ||
-			(loadingRuntimePkg && strings.HasPrefix(name, "type.")) {
+			(loadingRuntimePkg && strings.HasPrefix(name, "type:")) {
 			if bi := goobj.BuiltinIdx(name, int(osym.ABI())); bi != -1 {
 				// This is a definition of a builtin symbol. Record where it is.
 				l.builtinSyms[bi] = gi
@@ -2393,12 +2432,15 @@ func (l *Loader) RelocVariant(s Sym, ri int) sym.RelocVariant {
 // space, looking for symbols with relocations targeting undefined
 // references. The linker's loadlib method uses this to determine if
 // there are unresolved references to functions in system libraries
-// (for example, libgcc.a), presumably due to CGO code. Return
-// value is a list of loader.Sym's corresponding to the undefined
-// cross-refs. The "limit" param controls the maximum number of
-// results returned; if "limit" is -1, then all undefs are returned.
-func (l *Loader) UndefinedRelocTargets(limit int) []Sym {
-	result := []Sym{}
+// (for example, libgcc.a), presumably due to CGO code. Return value
+// is a pair of lists of loader.Sym's. First list corresponds to the
+// corresponding to the undefined symbols themselves, the second list
+// is the symbol that is making a reference to the undef. The "limit"
+// param controls the maximum number of results returned; if "limit"
+// is -1, then all undefs are returned.
+func (l *Loader) UndefinedRelocTargets(limit int) ([]Sym, []Sym) {
+	result, fromr := []Sym{}, []Sym{}
+outerloop:
 	for si := Sym(1); si < Sym(len(l.objSyms)); si++ {
 		relocs := l.Relocs(si)
 		for ri := 0; ri < relocs.Count(); ri++ {
@@ -2406,13 +2448,14 @@ func (l *Loader) UndefinedRelocTargets(limit int) []Sym {
 			rs := r.Sym()
 			if rs != 0 && l.SymType(rs) == sym.SXREF && l.SymName(rs) != ".got" {
 				result = append(result, rs)
+				fromr = append(fromr, si)
 				if limit != -1 && len(result) >= limit {
-					break
+					break outerloop
 				}
 			}
 		}
 	}
-	return result
+	return result, fromr
 }
 
 // AssignTextSymbolOrder populates the Textp slices within each

@@ -38,13 +38,13 @@ TEXT runtime·rt0_go(SB),NOSPLIT|TOPFRAME,$0
 	MOVD	R3, (g_stack+stack_lo)(g)
 	MOVD	R1, (g_stack+stack_hi)(g)
 
-	// if there is a _cgo_init, call it using the gcc ABI.
+	// If there is a _cgo_init, call it using the gcc ABI.
 	MOVD	_cgo_init(SB), R12
 	CMP	R0, R12
 	BEQ	nocgo
-#ifdef GOARCH_ppc64
-	// ppc64 use elf ABI v1. we must get the real entry address from
-	// first slot of the function descriptor before call.
+
+#ifdef GO_PPC64X_HAS_FUNCDESC
+	// Load the real entry address from the first slot of the function descriptor.
 	MOVD	8(R12), R2
 	MOVD	(R12), R12
 #endif
@@ -334,6 +334,16 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	UNDEF
 
 TEXT runtime·morestack_noctxt(SB),NOSPLIT|NOFRAME,$0-0
+	// Force SPWRITE. This function doesn't actually write SP,
+	// but it is called with a special calling convention where
+	// the caller doesn't save LR on stack but passes it as a
+	// register (R5), and the unwinder currently doesn't understand.
+	// Make it SPWRITE to stop unwinding. (See issue 54332)
+	// Use OR R0, R1 instead of MOVD R1, R1 as the MOVD instruction
+	// has a special affect on Power8,9,10 by lowering the thread 
+	// priority and causing a slowdown in execution time
+
+	OR	R0, R1
 	MOVD	R0, R11
 	BR	runtime·morestack(SB)
 
@@ -587,10 +597,8 @@ g0:
 	// This is a "global call", so put the global entry point in r12
 	MOVD	R3, R12
 
-#ifdef GOARCH_ppc64
-	// ppc64 use elf ABI v1. we must get the real entry address from
-	// first slot of the function descriptor before call.
-	// Same for AIX.
+#ifdef GO_PPC64X_HAS_FUNCDESC
+	// Load the real entry address from the first slot of the function descriptor.
 	MOVD	8(R12), R2
 	MOVD	(R12), R12
 #endif
@@ -918,41 +926,38 @@ TEXT ·checkASM(SB),NOSPLIT,$0-1
 	MOVB	R3, ret+0(FP)
 	RET
 
-// gcWriteBarrier performs a heap pointer write and informs the GC.
+// gcWriteBarrier informs the GC about heap pointer writes.
 //
-// gcWriteBarrier does NOT follow the Go ABI. It takes two arguments:
-// - R20 is the destination of the write
-// - R21 is the value being written at R20.
+// gcWriteBarrier does NOT follow the Go ABI. It accepts the
+// number of bytes of buffer needed in R29, and returns a pointer
+// to the buffer space in R29.
 // It clobbers condition codes.
 // It does not clobber R0 through R17 (except special registers),
 // but may clobber any other register, *including* R31.
-TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$112
+TEXT gcWriteBarrier<>(SB),NOSPLIT,$112
 	// The standard prologue clobbers R31.
-	// We use R18 and R19 as scratch registers.
+	// We use R18, R19, and R31 as scratch registers.
+retry:
 	MOVD	g_m(g), R18
 	MOVD	m_p(R18), R18
 	MOVD	(p_wbBuf+wbBuf_next)(R18), R19
+	MOVD	(p_wbBuf+wbBuf_end)(R18), R31
 	// Increment wbBuf.next position.
-	ADD	$16, R19
+	ADD	R29, R19
+	// Is the buffer full?
+	CMPU	R31, R19
+	BLT	flush
+	// Commit to the larger buffer.
 	MOVD	R19, (p_wbBuf+wbBuf_next)(R18)
-	MOVD	(p_wbBuf+wbBuf_end)(R18), R18
-	CMP	R18, R19
-	// Record the write.
-	MOVD	R21, -16(R19)	// Record value
-	MOVD	(R20), R18	// TODO: This turns bad writes into bad reads.
-	MOVD	R18, -8(R19)	// Record *slot
-	// Is the buffer full? (flags set in CMP above)
-	BEQ	flush
-ret:
-	// Do the write.
-	MOVD	R21, (R20)
+	// Make return value (the original next position)
+	SUB	R29, R19, R29
 	RET
 
 flush:
 	// Save registers R0 through R15 since these were not saved by the caller.
 	// We don't save all registers on ppc64 because it takes too much space.
-	MOVD	R20, (FIXED_FRAME+0)(R1)	// Also first argument to wbBufFlush
-	MOVD	R21, (FIXED_FRAME+8)(R1)	// Also second argument to wbBufFlush
+	MOVD	R20, (FIXED_FRAME+0)(R1)
+	MOVD	R21, (FIXED_FRAME+8)(R1)
 	// R0 is always 0, so no need to spill.
 	// R1 is SP.
 	// R2 is SB.
@@ -971,7 +976,6 @@ flush:
 	MOVD	R16, (FIXED_FRAME+96)(R1)
 	MOVD	R17, (FIXED_FRAME+104)(R1)
 
-	// This takes arguments R20 and R21.
 	CALL	runtime·wbBufFlush(SB)
 
 	MOVD	(FIXED_FRAME+0)(R1), R20
@@ -988,7 +992,32 @@ flush:
 	MOVD	(FIXED_FRAME+88)(R1), R15
 	MOVD	(FIXED_FRAME+96)(R1), R16
 	MOVD	(FIXED_FRAME+104)(R1), R17
-	JMP	ret
+	JMP	retry
+
+TEXT runtime·gcWriteBarrier1<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$8, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier2<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$16, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier3<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$24, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier4<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$32, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier5<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$40, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier6<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$48, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier7<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$56, R29
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$64, R29
+	JMP	gcWriteBarrier<>(SB)
 
 // Note: these functions use a special calling convention to save generated code space.
 // Arguments are passed in registers, but the space for those arguments are allocated

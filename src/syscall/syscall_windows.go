@@ -12,7 +12,6 @@ import (
 	"internal/itoa"
 	"internal/oserror"
 	"internal/race"
-	"internal/unsafeheader"
 	"runtime"
 	"sync"
 	"unicode/utf16"
@@ -43,7 +42,13 @@ func UTF16FromString(s string) ([]uint16, error) {
 	if bytealg.IndexByteString(s, 0) != -1 {
 		return nil, EINVAL
 	}
-	return utf16.Encode([]rune(s + "\x00")), nil
+	// In the worst case all characters require two uint16.
+	// Also account for the terminating NULL character.
+	buf := make([]uint16, 0, len(s)*2+1)
+	for _, r := range s {
+		buf = utf16.AppendRune(buf, r)
+	}
+	return utf16.AppendRune(buf, '\x00'), nil
 }
 
 // UTF16ToString returns the UTF-8 encoding of the UTF-16 sequence s,
@@ -72,11 +77,7 @@ func utf16PtrToString(p *uint16) string {
 		n++
 	}
 	// Turn *uint16 into []uint16.
-	var s []uint16
-	hdr := (*unsafeheader.Slice)(unsafe.Pointer(&s))
-	hdr.Data = unsafe.Pointer(p)
-	hdr.Cap = n
-	hdr.Len = n
+	s := unsafe.Slice(p, n)
 	// Decode []uint16 into string.
 	return string(utf16.Decode(s))
 }
@@ -102,8 +103,8 @@ func UTF16PtrFromString(s string) (*uint16, error) {
 
 // Errno is the Windows error number.
 //
-// Errno values can be tested against error values from the os package
-// using errors.Is. For example:
+// Errno values can be tested against error values using errors.Is.
+// For example:
 //
 //	_, _, err := syscall.Syscall(...)
 //	if errors.Is(err, fs.ErrNotExist) ...
@@ -141,20 +142,36 @@ func (e Errno) Error() string {
 	return string(utf16.Decode(b[:n]))
 }
 
-const _ERROR_BAD_NETPATH = Errno(53)
+const (
+	_ERROR_NOT_SUPPORTED        = Errno(50)
+	_ERROR_BAD_NETPATH          = Errno(53)
+	_ERROR_CALL_NOT_IMPLEMENTED = Errno(120)
+)
 
 func (e Errno) Is(target error) bool {
 	switch target {
 	case oserror.ErrPermission:
-		return e == ERROR_ACCESS_DENIED
+		return e == ERROR_ACCESS_DENIED ||
+			e == EACCES ||
+			e == EPERM
 	case oserror.ErrExist:
 		return e == ERROR_ALREADY_EXISTS ||
 			e == ERROR_DIR_NOT_EMPTY ||
-			e == ERROR_FILE_EXISTS
+			e == ERROR_FILE_EXISTS ||
+			e == EEXIST ||
+			e == ENOTEMPTY
 	case oserror.ErrNotExist:
 		return e == ERROR_FILE_NOT_FOUND ||
 			e == _ERROR_BAD_NETPATH ||
-			e == ERROR_PATH_NOT_FOUND
+			e == ERROR_PATH_NOT_FOUND ||
+			e == ENOENT
+	case errorspkg.ErrUnsupported:
+		return e == _ERROR_NOT_SUPPORTED ||
+			e == _ERROR_CALL_NOT_IMPLEMENTED ||
+			e == ENOSYS ||
+			e == ENOTSUP ||
+			e == EOPNOTSUPP ||
+			e == EWINDOWS
 	}
 	return false
 }
@@ -370,8 +387,11 @@ func Open(path string, mode int, perm uint32) (fd Handle, err error) {
 			}
 		}
 	}
-	h, e := CreateFile(pathp, access, sharemode, sa, createmode, attrs, 0)
-	return h, e
+	if createmode == OPEN_EXISTING && access == GENERIC_READ {
+		// Necessary for opening directory handles.
+		attrs |= FILE_FLAG_BACKUP_SEMANTICS
+	}
+	return CreateFile(pathp, access, sharemode, sa, createmode, attrs, 0)
 }
 
 func Read(fd Handle, p []byte) (n int, err error) {
@@ -836,8 +856,7 @@ func (rsa *RawSockaddrAny) Sockaddr() (Sockaddr, error) {
 		for n < len(pp.Path) && pp.Path[n] != 0 {
 			n++
 		}
-		bytes := (*[len(pp.Path)]byte)(unsafe.Pointer(&pp.Path[0]))[0:n:n]
-		sa.Name = string(bytes)
+		sa.Name = string(unsafe.Slice((*byte)(unsafe.Pointer(&pp.Path[0])), n))
 		return sa, nil
 
 	case AF_INET:
@@ -915,9 +934,13 @@ func Shutdown(fd Handle, how int) (err error) {
 }
 
 func WSASendto(s Handle, bufs *WSABuf, bufcnt uint32, sent *uint32, flags uint32, to Sockaddr, overlapped *Overlapped, croutine *byte) (err error) {
-	rsa, len, err := to.sockaddr()
-	if err != nil {
-		return err
+	var rsa unsafe.Pointer
+	var len int32
+	if to != nil {
+		rsa, len, err = to.sockaddr()
+		if err != nil {
+			return err
+		}
 	}
 	r1, _, e1 := Syscall9(procWSASendTo.Addr(), 9, uintptr(s), uintptr(unsafe.Pointer(bufs)), uintptr(bufcnt), uintptr(unsafe.Pointer(sent)), uintptr(flags), uintptr(unsafe.Pointer(rsa)), uintptr(len), uintptr(unsafe.Pointer(overlapped)), uintptr(unsafe.Pointer(croutine)))
 	if r1 == socket_error {

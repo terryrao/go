@@ -107,8 +107,18 @@ nocgo:
 DATA	runtime·mainPC+0(SB)/8,$runtime·main<ABIInternal>(SB)
 GLOBL	runtime·mainPC(SB),RODATA,$8
 
+// Windows ARM64 needs an immediate 0xf000 argument.
+// See go.dev/issues/53837.
+#define BREAK	\
+#ifdef GOOS_windows	\
+	BRK	$0xf000 	\
+#else 				\
+	BRK 			\
+#endif 				\
+
+
 TEXT runtime·breakpoint(SB),NOSPLIT|NOFRAME,$0-0
-	BRK
+	BREAK
 	RET
 
 TEXT runtime·asminit(SB),NOSPLIT|NOFRAME,$0-0
@@ -310,6 +320,13 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	UNDEF
 
 TEXT runtime·morestack_noctxt(SB),NOSPLIT|NOFRAME,$0-0
+	// Force SPWRITE. This function doesn't actually write SP,
+	// but it is called with a special calling convention where
+	// the caller doesn't save LR on stack but passes it as a
+	// register (R3), and the unwinder currently doesn't understand.
+	// Make it SPWRITE to stop unwinding. (See issue 54332)
+	MOVD	RSP, RSP
+
 	MOVW	$0, R26
 	B runtime·morestack(SB)
 
@@ -1171,46 +1188,41 @@ TEXT ·checkASM(SB),NOSPLIT,$0-1
 	MOVB	R3, ret+0(FP)
 	RET
 
-// gcWriteBarrier performs a heap pointer write and informs the GC.
+// gcWriteBarrier informs the GC about heap pointer writes.
 //
-// gcWriteBarrier does NOT follow the Go ABI. It takes two arguments:
-// - R2 is the destination of the write
-// - R3 is the value being written at R2
+// gcWriteBarrier does NOT follow the Go ABI. It accepts the
+// number of bytes of buffer needed in R25, and returns a pointer
+// to the buffer space in R25.
 // It clobbers condition codes.
-// It does not clobber any general-purpose registers,
+// It does not clobber any general-purpose registers except R27,
 // but may clobber others (e.g., floating point registers)
 // The act of CALLing gcWriteBarrier will clobber R30 (LR).
-//
-// Defined as ABIInternal since the compiler generates ABIInternal
-// calls to it directly and it does not use the stack-based Go ABI.
-TEXT runtime·gcWriteBarrier<ABIInternal>(SB),NOSPLIT,$200
+TEXT gcWriteBarrier<>(SB),NOSPLIT,$200
 	// Save the registers clobbered by the fast path.
 	STP	(R0, R1), 184(RSP)
+retry:
 	MOVD	g_m(g), R0
 	MOVD	m_p(R0), R0
 	MOVD	(p_wbBuf+wbBuf_next)(R0), R1
+	MOVD	(p_wbBuf+wbBuf_end)(R0), R27
 	// Increment wbBuf.next position.
-	ADD	$16, R1
+	ADD	R25, R1
+	// Is the buffer full?
+	CMP	R27, R1
+	BHI	flush
+	// Commit to the larger buffer.
 	MOVD	R1, (p_wbBuf+wbBuf_next)(R0)
-	MOVD	(p_wbBuf+wbBuf_end)(R0), R0
-	CMP	R1, R0
-	// Record the write.
-	MOVD	R3, -16(R1)	// Record value
-	MOVD	(R2), R0	// TODO: This turns bad writes into bad reads.
-	MOVD	R0, -8(R1)	// Record *slot
-	// Is the buffer full? (flags set in CMP above)
-	BEQ	flush
-ret:
+	// Make return value (the original next position)
+	SUB	R25, R1, R25
+	// Restore registers.
 	LDP	184(RSP), (R0, R1)
-	// Do the write.
-	MOVD	R3, (R2)
 	RET
 
 flush:
 	// Save all general purpose registers since these could be
 	// clobbered by wbBufFlush and were not saved by the caller.
 	// R0 and R1 already saved
-	STP	(R2, R3), 1*8(RSP)	// Also first and second arguments to wbBufFlush
+	STP	(R2, R3), 1*8(RSP)
 	STP	(R4, R5), 3*8(RSP)
 	STP	(R6, R7), 5*8(RSP)
 	STP	(R8, R9), 7*8(RSP)
@@ -1229,7 +1241,6 @@ flush:
 	// R30 is LR, which was saved by the prologue.
 	// R31 is SP.
 
-	// This takes arguments R2 and R3.
 	CALL	runtime·wbBufFlush(SB)
 	LDP	1*8(RSP), (R2, R3)
 	LDP	3*8(RSP), (R4, R5)
@@ -1242,7 +1253,32 @@ flush:
 	LDP	17*8(RSP), (R21, R22)
 	LDP	19*8(RSP), (R23, R24)
 	LDP	21*8(RSP), (R25, R26)
-	JMP	ret
+	JMP	retry
+
+TEXT runtime·gcWriteBarrier1<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$8, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier2<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$16, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier3<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$24, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier4<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$32, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier5<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$40, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier6<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$48, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier7<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$56, R25
+	JMP	gcWriteBarrier<>(SB)
+TEXT runtime·gcWriteBarrier8<ABIInternal>(SB),NOSPLIT,$0
+	MOVD	$64, R25
+	JMP	gcWriteBarrier<>(SB)
 
 DATA	debugCallFrameTooLarge<>+0x00(SB)/20, $"call frame too large"
 GLOBL	debugCallFrameTooLarge<>(SB), RODATA, $20	// Size duplicated below
@@ -1325,7 +1361,7 @@ TEXT runtime·debugCallV2<ABIInternal>(SB),NOSPLIT|NOFRAME,$0-0
 	// Set R20 to 8 and invoke BRK. The debugger should get the
 	// reason a call can't be injected from SP+8 and resume execution.
 	MOVD	$8, R20
-	BRK
+	BREAK
 	JMP	restore
 
 good:
@@ -1374,7 +1410,7 @@ good:
 	MOVD	$20, R0
 	MOVD	R0, 16(RSP) // length of debugCallFrameTooLarge string
 	MOVD	$8, R20
-	BRK
+	BREAK
 	JMP	restore
 
 restore:
@@ -1383,7 +1419,7 @@ restore:
 	// Set R20 to 16 and invoke BRK. The debugger should restore
 	// all registers except for PC and RSP and resume execution.
 	MOVD	$16, R20
-	BRK
+	BREAK
 	// We must not modify flags after this point.
 
 	// Restore pointer-containing registers, which may have been
@@ -1414,9 +1450,9 @@ restore:
 TEXT NAME(SB),WRAPPER,$MAXSIZE-0;		\
 	NO_LOCAL_POINTERS;		\
 	MOVD	$0, R20;		\
-	BRK;		\
+	BREAK;		\
 	MOVD	$1, R20;		\
-	BRK;		\
+	BREAK;		\
 	RET
 DEBUG_CALL_FN(debugCall32<>, 32)
 DEBUG_CALL_FN(debugCall64<>, 64)
@@ -1439,7 +1475,7 @@ TEXT runtime·debugCallPanicked(SB),NOSPLIT,$16-16
 	MOVD	val_data+8(FP), R0
 	MOVD	R0, 16(RSP)
 	MOVD	$2, R20
-	BRK
+	BREAK
 	RET
 
 // Note: these functions use a special calling convention to save generated code space.
@@ -1506,3 +1542,7 @@ TEXT runtime·panicSliceConvert<ABIInternal>(SB),NOSPLIT,$0-16
 	MOVD	R2, R0
 	MOVD	R3, R1
 	JMP	runtime·goPanicSliceConvert<ABIInternal>(SB)
+
+TEXT ·getcallerfp<ABIInternal>(SB),NOSPLIT|NOFRAME,$0
+	MOVD R29, R0
+	RET

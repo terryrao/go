@@ -202,6 +202,7 @@ func (p *Prog) WriteInstructionString(w io.Writer) {
 	if p.To.Type != TYPE_NONE {
 		io.WriteString(w, sep)
 		WriteDconv(w, p, &p.To)
+		sep = ", "
 	}
 	if p.RegTo2 != REG_NONE {
 		fmt.Fprintf(w, "%s%v", sep, Rconv(int(p.RegTo2)))
@@ -233,7 +234,7 @@ func Dconv(p *Prog, a *Addr) string {
 	return buf.String()
 }
 
-// DconvDconvWithABIDetail accepts an argument 'a' within a prog 'p'
+// DconvWithABIDetail accepts an argument 'a' within a prog 'p'
 // and returns a string with a formatted version of the argument, in
 // which text symbols are rendered with explicit ABI selectors.
 func DconvWithABIDetail(p *Prog, a *Addr) string {

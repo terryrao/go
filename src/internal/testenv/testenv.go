@@ -16,7 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"internal/cfg"
-	"internal/testmath"
+	"internal/platform"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +25,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 // Builder reports the name of the builder running this test
@@ -194,37 +193,39 @@ func GOROOT(t testing.TB) string {
 
 // GoTool reports the path to the Go tool.
 func GoTool() (string, error) {
-	if !HasGoBuild() {
-		return "", errors.New("platform cannot run go tool")
-	}
-	var exeSuffix string
-	if runtime.GOOS == "windows" {
-		exeSuffix = ".exe"
-	}
-	goroot, err := findGOROOT()
-	if err != nil {
-		return "", fmt.Errorf("cannot find go tool: %w", err)
-	}
-	path := filepath.Join(goroot, "bin", "go"+exeSuffix)
-	if _, err := os.Stat(path); err == nil {
-		return path, nil
-	}
-	goBin, err := exec.LookPath("go" + exeSuffix)
-	if err != nil {
-		return "", errors.New("cannot find go tool: " + err.Error())
-	}
-	return goBin, nil
+	goToolOnce.Do(func() {
+		goToolPath, goToolErr = func() (string, error) {
+			if !HasGoBuild() {
+				return "", errors.New("platform cannot run go tool")
+			}
+			var exeSuffix string
+			if runtime.GOOS == "windows" {
+				exeSuffix = ".exe"
+			}
+			goroot, err := findGOROOT()
+			if err != nil {
+				return "", fmt.Errorf("cannot find go tool: %w", err)
+			}
+			path := filepath.Join(goroot, "bin", "go"+exeSuffix)
+			if _, err := os.Stat(path); err == nil {
+				return path, nil
+			}
+			goBin, err := exec.LookPath("go" + exeSuffix)
+			if err != nil {
+				return "", errors.New("cannot find go tool: " + err.Error())
+			}
+			return goBin, nil
+		}()
+	})
+
+	return goToolPath, goToolErr
 }
 
-// HasExec reports whether the current system can start new processes
-// using os.StartProcess or (more commonly) exec.Command.
-func HasExec() bool {
-	switch runtime.GOOS {
-	case "js", "ios":
-		return false
-	}
-	return true
-}
+var (
+	goToolOnce sync.Once
+	goToolPath string
+	goToolErr  error
+)
 
 // HasSrc reports whether the entire source tree is available under GOROOT.
 func HasSrc() bool {
@@ -233,33 +234,6 @@ func HasSrc() bool {
 		return false
 	}
 	return true
-}
-
-// MustHaveExec checks that the current system can start new processes
-// using os.StartProcess or (more commonly) exec.Command.
-// If not, MustHaveExec calls t.Skip with an explanation.
-func MustHaveExec(t testing.TB) {
-	if !HasExec() {
-		t.Skipf("skipping test: cannot exec subprocess on %s/%s", runtime.GOOS, runtime.GOARCH)
-	}
-}
-
-var execPaths sync.Map // path -> error
-
-// MustHaveExecPath checks that the current system can start the named executable
-// using os.StartProcess or (more commonly) exec.Command.
-// If not, MustHaveExecPath calls t.Skip with an explanation.
-func MustHaveExecPath(t testing.TB, path string) {
-	MustHaveExec(t)
-
-	err, found := execPaths.Load(path)
-	if !found {
-		_, err = exec.LookPath(path)
-		err, _ = execPaths.LoadOrStore(path, err)
-	}
-	if err != nil {
-		t.Skipf("skipping test: %s: %s", path, err)
-	}
 }
 
 // HasExternalNetwork reports whether the current system can use
@@ -280,42 +254,52 @@ func MustHaveExternalNetwork(t testing.TB) {
 	}
 }
 
-var haveCGO bool
-
 // HasCGO reports whether the current system can use cgo.
 func HasCGO() bool {
-	return haveCGO
+	hasCgoOnce.Do(func() {
+		goTool, err := GoTool()
+		if err != nil {
+			return
+		}
+		cmd := exec.Command(goTool, "env", "CGO_ENABLED")
+		out, err := cmd.Output()
+		if err != nil {
+			panic(fmt.Sprintf("%v: %v", cmd, out))
+		}
+		hasCgo, err = strconv.ParseBool(string(bytes.TrimSpace(out)))
+		if err != nil {
+			panic(fmt.Sprintf("%v: non-boolean output %q", cmd, out))
+		}
+	})
+	return hasCgo
 }
+
+var (
+	hasCgoOnce sync.Once
+	hasCgo     bool
+)
 
 // MustHaveCGO calls t.Skip if cgo is not available.
 func MustHaveCGO(t testing.TB) {
-	if !haveCGO {
+	if !HasCGO() {
 		t.Skipf("skipping test: no cgo")
 	}
 }
 
 // CanInternalLink reports whether the current system can link programs with
 // internal linking.
-// (This is the opposite of cmd/internal/sys.MustLinkExternal. Keep them in sync.)
-func CanInternalLink() bool {
-	switch runtime.GOOS {
-	case "android":
-		if runtime.GOARCH != "arm64" {
-			return false
-		}
-	case "ios":
-		if runtime.GOARCH == "arm64" {
-			return false
-		}
-	}
-	return true
+func CanInternalLink(withCgo bool) bool {
+	return !platform.MustLinkExternal(runtime.GOOS, runtime.GOARCH, withCgo)
 }
 
 // MustInternalLink checks that the current system can link programs with internal
 // linking.
 // If not, MustInternalLink calls t.Skip with an explanation.
-func MustInternalLink(t testing.TB) {
-	if !CanInternalLink() {
+func MustInternalLink(t testing.TB, withCgo bool) {
+	if !CanInternalLink(withCgo) {
+		if withCgo && CanInternalLink(false) {
+			t.Skipf("skipping test: internal linking on %s/%s is not supported with cgo", runtime.GOOS, runtime.GOARCH)
+		}
 		t.Skipf("skipping test: internal linking on %s/%s is not supported", runtime.GOOS, runtime.GOARCH)
 	}
 }
@@ -367,28 +351,6 @@ func SkipFlakyNet(t testing.TB) {
 	}
 }
 
-// CleanCmdEnv will fill cmd.Env with the environment, excluding certain
-// variables that could modify the behavior of the Go tools such as
-// GODEBUG and GOTRACEBACK.
-func CleanCmdEnv(cmd *exec.Cmd) *exec.Cmd {
-	if cmd.Env != nil {
-		panic("environment already set")
-	}
-	for _, env := range os.Environ() {
-		// Exclude GODEBUG from the environment to prevent its output
-		// from breaking tests that are trying to parse other command output.
-		if strings.HasPrefix(env, "GODEBUG=") {
-			continue
-		}
-		// Exclude GOTRACEBACK for the same reason.
-		if strings.HasPrefix(env, "GOTRACEBACK=") {
-			continue
-		}
-		cmd.Env = append(cmd.Env, env)
-	}
-	return cmd
-}
-
 // CPUIsSlow reports whether the CPU running the test is suspected to be slow.
 func CPUIsSlow() bool {
 	switch runtime.GOARCH {
@@ -409,122 +371,60 @@ func SkipIfShortAndSlow(t testing.TB) {
 	}
 }
 
-// RunWithTimeout runs cmd and returns its combined output. If the
-// subprocess exits with a non-zero status, it will log that status
-// and return a non-nil error, but this is not considered fatal.
-func RunWithTimeout(t testing.TB, cmd *exec.Cmd) ([]byte, error) {
-	args := cmd.Args
-	if args == nil {
-		args = []string{cmd.Path}
+// SkipIfOptimizationOff skips t if optimization is disabled.
+func SkipIfOptimizationOff(t testing.TB) {
+	if OptimizationOff() {
+		t.Helper()
+		t.Skip("skipping test with optimization disabled")
 	}
-
-	var b bytes.Buffer
-	cmd.Stdout = &b
-	cmd.Stderr = &b
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting %s: %v", args, err)
-	}
-
-	// If the process doesn't complete within 1 minute,
-	// assume it is hanging and kill it to get a stack trace.
-	p := cmd.Process
-	done := make(chan bool)
-	go func() {
-		scale := 1
-		// This GOARCH/GOOS test is copied from cmd/dist/test.go.
-		// TODO(iant): Have cmd/dist update the environment variable.
-		if runtime.GOARCH == "arm" || runtime.GOOS == "windows" {
-			scale = 2
-		}
-		if s := os.Getenv("GO_TEST_TIMEOUT_SCALE"); s != "" {
-			if sc, err := strconv.Atoi(s); err == nil {
-				scale = sc
-			}
-		}
-
-		select {
-		case <-done:
-		case <-time.After(time.Duration(scale) * time.Minute):
-			p.Signal(Sigquit)
-			// If SIGQUIT doesn't do it after a little
-			// while, kill the process.
-			select {
-			case <-done:
-			case <-time.After(time.Duration(scale) * 30 * time.Second):
-				p.Signal(os.Kill)
-			}
-		}
-	}()
-
-	err := cmd.Wait()
-	if err != nil {
-		t.Logf("%s exit status: %v", args, err)
-	}
-	close(done)
-
-	return b.Bytes(), err
 }
 
-// CheckLinear checks if the function produced by f scales linearly.
+// WriteImportcfg writes an importcfg file used by the compiler or linker to
+// dstPath containing entries for the file mappings in packageFiles, as well
+// as for the packages transitively imported by the package(s) in pkgs.
 //
-// f must accept a scale factor which causes the input to the function it
-// produces to scale by that factor.
-func CheckLinear(t *testing.T, f func(scale float64) func(*testing.B)) {
-	MustHaveExec(t)
+// pkgs may include any package pattern that is valid to pass to 'go list',
+// so it may also be a list of Go source files all in the same directory.
+func WriteImportcfg(t testing.TB, dstPath string, packageFiles map[string]string, pkgs ...string) {
+	t.Helper()
 
-	if os.Getenv("GO_PERF_UNIT_TEST") == "" {
-		// Invoke the same test as a subprocess with the GO_PERF_UNIT_TEST environment variable set.
-		// We create a subprocess for two reasons:
-		//
-		//   1. There's no other way to set the benchmarking parameters of testing.Benchmark.
-		//   2. Since we're effectively running a performance test, running in a subprocess grants
-		//      us a little bit more isolation than using the same process.
-		//
-		// As an alternative, we could fairly easily reimplement the timing code in testing.Benchmark,
-		// but a subprocess is just as easy to create.
+	icfg := new(bytes.Buffer)
+	icfg.WriteString("# import config\n")
+	for k, v := range packageFiles {
+		fmt.Fprintf(icfg, "packagefile %s=%s\n", k, v)
+	}
 
-		selfCmd := CleanCmdEnv(exec.Command(os.Args[0], "-test.v", fmt.Sprintf("-test.run=^%s$", t.Name()), "-test.benchtime=1x"))
-		selfCmd.Env = append(selfCmd.Env, "GO_PERF_UNIT_TEST=1")
-		output, err := RunWithTimeout(t, selfCmd)
+	if len(pkgs) > 0 {
+		// Use 'go list' to resolve any missing packages and rewrite the import map.
+		cmd := Command(t, GoToolPath(t), "list", "-export", "-deps", "-f", `{{if ne .ImportPath "command-line-arguments"}}{{if .Export}}{{.ImportPath}}={{.Export}}{{end}}{{end}}`)
+		cmd.Args = append(cmd.Args, pkgs...)
+		cmd.Stderr = new(strings.Builder)
+		out, err := cmd.Output()
 		if err != nil {
-			t.Error(err)
-			t.Logf("--- subprocess output ---\n%s", string(output))
+			t.Fatalf("%v: %v\n%s", cmd, err, cmd.Stderr)
 		}
-		if bytes.Contains(output, []byte("insignificant result")) {
-			t.Skip("insignificant result")
+
+		for _, line := range strings.Split(string(out), "\n") {
+			if line == "" {
+				continue
+			}
+			importPath, export, ok := strings.Cut(line, "=")
+			if !ok {
+				t.Fatalf("invalid line in output from %v:\n%s", cmd, line)
+			}
+			if packageFiles[importPath] == "" {
+				fmt.Fprintf(icfg, "packagefile %s=%s\n", importPath, export)
+			}
 		}
-		return
 	}
 
-	// Pick a reasonable sample count.
-	const count = 10
+	if err := os.WriteFile(dstPath, icfg.Bytes(), 0666); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	// Collect samples for scale factor 1.
-	x1 := make([]testing.BenchmarkResult, 0, count)
-	for i := 0; i < count; i++ {
-		x1 = append(x1, testing.Benchmark(f(1.0)))
-	}
-
-	// Collect samples for scale factor 2.
-	x2 := make([]testing.BenchmarkResult, 0, count)
-	for i := 0; i < count; i++ {
-		x2 = append(x2, testing.Benchmark(f(2.0)))
-	}
-
-	// Run a t-test on the results.
-	r1 := testmath.BenchmarkResults(x1)
-	r2 := testmath.BenchmarkResults(x2)
-	result, err := testmath.TwoSampleWelchTTest(r1, r2, testmath.LocationDiffers)
-	if err != nil {
-		t.Fatalf("failed to run t-test: %v", err)
-	}
-	if result.P > 0.005 {
-		// Insignificant result.
-		t.Skip("insignificant result")
-	}
-
-	// Let ourselves be within 3x; 2x is too strict.
-	if m1, m2 := r1.Mean(), r2.Mean(); 3.0*m1 < m2 {
-		t.Fatalf("failure to scale linearly: µ_1=%s µ_2=%s p=%f", time.Duration(m1), time.Duration(m2), result.P)
-	}
+// SyscallIsNotSupported reports whether err may indicate that a system call is
+// not supported by the current platform or execution environment.
+func SyscallIsNotSupported(err error) bool {
+	return syscallIsNotSupported(err)
 }

@@ -54,7 +54,10 @@ func LookPath(file string) (string, error) {
 		path := filepath.Join(dir, file)
 		if err := findExecutable(path); err == nil {
 			if !filepath.IsAbs(path) {
-				return path, &Error{file, ErrDot}
+				if execerrdot.Value() != "0" {
+					return path, &Error{file, ErrDot}
+				}
+				execerrdot.IncNonDefault()
 			}
 			return path, nil
 		}

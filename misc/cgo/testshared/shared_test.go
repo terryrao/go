@@ -108,6 +108,15 @@ func testMain(m *testing.M) (int, error) {
 		defer os.RemoveAll(workDir)
 	}
 
+	// -buildmode=shared fundamentally does not work in module mode.
+	// (It tries to share package dependencies across builds, but in module mode
+	// each module has its own distinct set of dependency versions.)
+	// We would like to eliminate it (see https://go.dev/issue/47788),
+	// but first need to figure out a replacement that covers the small subset
+	// of use-cases where -buildmode=shared still works today.
+	// For now, run the tests in GOPATH mode only.
+	os.Setenv("GO111MODULE", "off")
+
 	// Some tests need to edit the source in GOPATH, so copy this directory to a
 	// temporary directory and chdir to that.
 	gopath := filepath.Join(workDir, "gopath")
@@ -142,16 +151,16 @@ func testMain(m *testing.M) (int, error) {
 	myContext := build.Default
 	myContext.GOROOT = goroot
 	myContext.GOPATH = gopath
-	runtimeP, err := myContext.Import("runtime", ".", build.ImportComment)
-	if err != nil {
-		return 0, fmt.Errorf("import failed: %v", err)
-	}
-	gorootInstallDir = runtimeP.PkgTargetRoot + "_dynlink"
 
 	// All tests depend on runtime being built into a shared library. Because
 	// that takes a few seconds, do it here and have all tests use the version
 	// built here.
 	goCmd(nil, append([]string{"install", "-buildmode=shared"}, minpkgs...)...)
+
+	shlib := goCmd(nil, "list", "-linkshared", "-f={{.Shlib}}", "runtime")
+	if shlib != "" {
+		gorootInstallDir = filepath.Dir(shlib)
+	}
 
 	myContext.InstallSuffix = "_dynlink"
 	depP, err := myContext.Import("./depBase", ".", build.ImportComment)
@@ -519,6 +528,9 @@ func checkPIE(t *testing.T, name string) {
 }
 
 func TestTrivialPIE(t *testing.T) {
+	if strings.HasSuffix(os.Getenv("GO_BUILDER_NAME"), "-alpine") {
+		t.Skip("skipping on alpine until issue #54354 resolved")
+	}
 	name := "trivial_pie"
 	goCmd(t, "build", "-buildmode=pie", "-o="+name, "./trivial")
 	defer os.Remove(name)
@@ -580,12 +592,12 @@ func testABIHashNote(t *testing.T, f *elf.File, note *note) {
 		return
 	}
 	for _, sym := range symbols {
-		if sym.Name == "go.link.abihashbytes" {
+		if sym.Name == "go:link.abihashbytes" {
 			hashbytes = sym
 		}
 	}
 	if hashbytes.Name == "" {
-		t.Errorf("no symbol called go.link.abihashbytes")
+		t.Errorf("no symbol called go:link.abihashbytes")
 		return
 	}
 	if elf.ST_BIND(hashbytes.Info) != elf.STB_LOCAL {
@@ -1088,8 +1100,25 @@ func TestIssue44031(t *testing.T) {
 
 // Test that we use a variable from shared libraries (which implement an
 // interface in shared libraries.). A weak reference is used in the itab
-// in main process. It can cause unreacheble panic. See issue 47873.
+// in main process. It can cause unreachable panic. See issue 47873.
 func TestIssue47873(t *testing.T) {
 	goCmd(t, "install", "-buildmode=shared", "-linkshared", "./issue47837/a")
 	goCmd(t, "run", "-linkshared", "./issue47837/main")
+}
+
+// Test that we can build std in shared mode.
+func TestStd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skip in short mode")
+	}
+	t.Parallel()
+	tmpDir := t.TempDir()
+	// Use a temporary pkgdir to not interfere with other tests, and not write to GOROOT.
+	// Cannot use goCmd as it runs with cloned GOROOT which is incomplete.
+	runWithEnv(t, "building std", []string{"GOROOT=" + oldGOROOT},
+		filepath.Join(oldGOROOT, "bin", "go"), "install", "-buildmode=shared", "-pkgdir="+tmpDir, "std")
+
+	// Issue #58966.
+	runWithEnv(t, "testing issue #58966", []string{"GOROOT=" + oldGOROOT},
+		filepath.Join(oldGOROOT, "bin", "go"), "run", "-linkshared", "-pkgdir="+tmpDir, "./issue58966/main.go")
 }

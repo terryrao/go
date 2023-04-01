@@ -34,6 +34,7 @@ var builtinFuncs = [...]struct {
 }{
 	{"append", ir.OAPPEND},
 	{"cap", ir.OCAP},
+	{"clear", ir.OCLEAR},
 	{"close", ir.OCLOSE},
 	{"complex", ir.OCOMPLEX},
 	{"copy", ir.OCOPY},
@@ -58,6 +59,9 @@ var unsafeFuncs = [...]struct {
 	{"Offsetof", ir.OOFFSETOF},
 	{"Sizeof", ir.OSIZEOF},
 	{"Slice", ir.OUNSAFESLICE},
+	{"SliceData", ir.OUNSAFESLICEDATA},
+	{"String", ir.OUNSAFESTRING},
+	{"StringData", ir.OUNSAFESTRINGDATA},
 }
 
 // InitUniverse initializes the universe block.
@@ -92,8 +96,8 @@ func InitUniverse() {
 	s = Lookup("_")
 	types.BlankSym = s
 	s.Def = NewName(s)
-	ir.AsNode(s.Def).SetType(types.Types[types.TBLANK])
 	ir.BlankNode = ir.AsNode(s.Def)
+	ir.BlankNode.SetType(types.Types[types.TBLANK])
 	ir.BlankNode.SetTypecheck(1)
 
 	s = types.BuiltinPkg.Lookup("_")

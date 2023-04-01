@@ -11,8 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"go/constant"
+	. "internal/types/errors"
 )
 
+// nopos indicates an unknown position
 var nopos syntax.Pos
 
 // debugging/development support
@@ -267,7 +269,7 @@ func (check *Checker) initFiles(files []*syntax.File) {
 			if name != "_" {
 				pkg.name = name
 			} else {
-				check.error(file.PkgName, "invalid package name _")
+				check.error(file.PkgName, BlankPkgName, "invalid package name _")
 			}
 			fallthrough
 
@@ -275,7 +277,7 @@ func (check *Checker) initFiles(files []*syntax.File) {
 			check.files = append(check.files, file)
 
 		default:
-			check.errorf(file, "package %s; expected %s", name, pkg.name)
+			check.errorf(file, MismatchedPkgName, "package %s; expected %s", name, pkg.name)
 			// ignore this file
 		}
 	}
@@ -425,7 +427,7 @@ func (check *Checker) record(x *operand) {
 }
 
 func (check *Checker) recordUntyped() {
-	if !debug && check.Types == nil {
+	if !debug && !check.recordTypes() {
 		return // nothing to do
 	}
 
@@ -453,6 +455,35 @@ func (check *Checker) recordTypeAndValue(x syntax.Expr, mode operandMode, typ Ty
 	if m := check.Types; m != nil {
 		m[x] = TypeAndValue{mode, typ, val}
 	}
+	if check.StoreTypesInSyntax {
+		tv := TypeAndValue{mode, typ, val}
+		stv := syntax.TypeAndValue{Type: typ, Value: val}
+		if tv.IsVoid() {
+			stv.SetIsVoid()
+		}
+		if tv.IsType() {
+			stv.SetIsType()
+		}
+		if tv.IsBuiltin() {
+			stv.SetIsBuiltin()
+		}
+		if tv.IsValue() {
+			stv.SetIsValue()
+		}
+		if tv.IsNil() {
+			stv.SetIsNil()
+		}
+		if tv.Addressable() {
+			stv.SetAddressable()
+		}
+		if tv.Assignable() {
+			stv.SetAssignable()
+		}
+		if tv.HasOk() {
+			stv.SetHasOk()
+		}
+		x.SetTypeInfo(stv)
+	}
 }
 
 func (check *Checker) recordBuiltinType(f syntax.Expr, sig *Signature) {
@@ -473,23 +504,46 @@ func (check *Checker) recordBuiltinType(f syntax.Expr, sig *Signature) {
 	}
 }
 
-func (check *Checker) recordCommaOkTypes(x syntax.Expr, a [2]Type) {
+// recordCommaOkTypes updates recorded types to reflect that x is used in a commaOk context
+// (and therefore has tuple type).
+func (check *Checker) recordCommaOkTypes(x syntax.Expr, a []*operand) {
 	assert(x != nil)
-	if a[0] == nil || a[1] == nil {
+	assert(len(a) == 2)
+	if a[0].mode == invalid {
 		return
 	}
-	assert(isTyped(a[0]) && isTyped(a[1]) && (isBoolean(a[1]) || a[1] == universeError))
+	t0, t1 := a[0].typ, a[1].typ
+	assert(isTyped(t0) && isTyped(t1) && (isBoolean(t1) || t1 == universeError))
 	if m := check.Types; m != nil {
 		for {
 			tv := m[x]
 			assert(tv.Type != nil) // should have been recorded already
 			pos := x.Pos()
 			tv.Type = NewTuple(
-				NewVar(pos, check.pkg, "", a[0]),
-				NewVar(pos, check.pkg, "", a[1]),
+				NewVar(pos, check.pkg, "", t0),
+				NewVar(pos, check.pkg, "", t1),
 			)
 			m[x] = tv
 			// if x is a parenthesized expression (p.X), update p.X
+			p, _ := x.(*syntax.ParenExpr)
+			if p == nil {
+				break
+			}
+			x = p.X
+		}
+	}
+	if check.StoreTypesInSyntax {
+		// Note: this loop is duplicated because the type of tv is different.
+		// Above it is types2.TypeAndValue, here it is syntax.TypeAndValue.
+		for {
+			tv := x.GetTypeInfo()
+			assert(tv.Type != nil) // should have been recorded already
+			pos := x.Pos()
+			tv.Type = NewTuple(
+				NewVar(pos, check.pkg, "", t0),
+				NewVar(pos, check.pkg, "", t1),
+			)
+			x.SetTypeInfo(tv)
 			p, _ := x.(*syntax.ParenExpr)
 			if p == nil {
 				break

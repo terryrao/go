@@ -220,6 +220,16 @@ type writer struct {
 	ctxt    *Link
 	pkgpath string   // the package import path (escaped), "" if unknown
 	pkglist []string // list of packages referenced, indexed by ctxt.pkgIdx
+
+	// scratch space for writing (the Write methods escape
+	// as they are interface calls)
+	tmpSym      goobj.Sym
+	tmpReloc    goobj.Reloc
+	tmpAux      goobj.Aux
+	tmpHash64   goobj.Hash64Type
+	tmpHash     goobj.HashType
+	tmpRefFlags goobj.RefFlags
+	tmpRefName  goobj.RefName
 }
 
 // prepare package index list
@@ -321,18 +331,21 @@ func (w *writer) Sym(s *LSym) {
 	if s.ReflectMethod() {
 		flag |= goobj.SymFlagReflectMethod
 	}
-	if strings.HasPrefix(s.Name, "type.") && s.Name[5] != '.' && s.Type == objabi.SRODATA {
+	if strings.HasPrefix(s.Name, "type:") && s.Name[5] != '.' && s.Type == objabi.SRODATA {
 		flag |= goobj.SymFlagGoType
 	}
 	flag2 := uint8(0)
 	if s.UsedInIface() {
 		flag2 |= goobj.SymFlagUsedInIface
 	}
-	if strings.HasPrefix(s.Name, "go.itab.") && s.Type == objabi.SRODATA {
+	if strings.HasPrefix(s.Name, "go:itab.") && s.Type == objabi.SRODATA {
 		flag2 |= goobj.SymFlagItab
 	}
 	if strings.HasPrefix(s.Name, w.ctxt.Pkgpath) && strings.HasPrefix(s.Name[len(w.ctxt.Pkgpath):], ".") && strings.HasPrefix(s.Name[len(w.ctxt.Pkgpath)+1:], objabi.GlobalDictPrefix) {
 		flag2 |= goobj.SymFlagDict
+	}
+	if s.IsPkgInit() {
+		flag2 |= goobj.SymFlagPkgInit
 	}
 	name := s.Name
 	if strings.HasPrefix(name, "gofile..") {
@@ -343,7 +356,7 @@ func (w *writer) Sym(s *LSym) {
 		align = uint32(fn.Align)
 	}
 	if s.ContentAddressable() && s.Size != 0 {
-		// We generally assume data symbols are natually aligned
+		// We generally assume data symbols are naturally aligned
 		// (e.g. integer constants), except for strings and a few
 		// compiler-emitted funcdata. If we dedup a string symbol and
 		// a non-string symbol with the same content, we should keep
@@ -351,10 +364,9 @@ func (w *writer) Sym(s *LSym) {
 		// TODO: maybe the compiler could set the alignment for all
 		// data symbols more carefully.
 		switch {
-		case strings.HasPrefix(s.Name, "go.string."),
-			strings.HasPrefix(name, "type..namedata."),
-			strings.HasPrefix(name, "type..importpath."),
-			strings.HasPrefix(name, "runtime.gcbits."),
+		case strings.HasPrefix(s.Name, "go:string."),
+			strings.HasPrefix(name, "type:.namedata."),
+			strings.HasPrefix(name, "type:.importpath."),
 			strings.HasSuffix(name, ".opendefer"),
 			strings.HasSuffix(name, ".arginfo0"),
 			strings.HasSuffix(name, ".arginfo1"),
@@ -380,7 +392,7 @@ func (w *writer) Sym(s *LSym) {
 	if s.Size > cutoff {
 		w.ctxt.Diag("%s: symbol too large (%d bytes > %d bytes)", s.Name, s.Size, cutoff)
 	}
-	var o goobj.Sym
+	o := &w.tmpSym
 	o.SetName(name, w.Writer)
 	o.SetABI(abi)
 	o.SetType(uint8(s.Type))
@@ -395,16 +407,16 @@ func (w *writer) Hash64(s *LSym) {
 	if !s.ContentAddressable() || len(s.R) != 0 {
 		panic("Hash of non-content-addressable symbol")
 	}
-	b := contentHash64(s)
-	w.Bytes(b[:])
+	w.tmpHash64 = contentHash64(s)
+	w.Bytes(w.tmpHash64[:])
 }
 
 func (w *writer) Hash(s *LSym) {
 	if !s.ContentAddressable() {
 		panic("Hash of non-content-addressable symbol")
 	}
-	b := w.contentHash(s)
-	w.Bytes(b[:])
+	w.tmpHash = w.contentHash(s)
+	w.Bytes(w.tmpHash[:])
 }
 
 // contentHashSection returns a mnemonic for s's section.
@@ -412,7 +424,7 @@ func (w *writer) Hash(s *LSym) {
 // contentHashSection only distinguishes between sets of sections for which this matters.
 // Allowing flexibility increases the effectiveness of content-addressibility.
 // But in some cases, such as doing addressing based on a base symbol,
-// we need to ensure that a symbol is always in a prticular section.
+// we need to ensure that a symbol is always in a particular section.
 // Some of these conditions are duplicated in cmd/link/internal/ld.(*Link).symtab.
 // TODO: instead of duplicating them, have the compiler decide where symbols go.
 func contentHashSection(s *LSym) byte {
@@ -430,9 +442,9 @@ func contentHashSection(s *LSym) byte {
 		strings.HasSuffix(name, ".wrapinfo") ||
 		strings.HasSuffix(name, ".args_stackmap") ||
 		strings.HasSuffix(name, ".stkobj") {
-		return 'F' // go.func.* or go.funcrel.*
+		return 'F' // go:func.* or go:funcrel.*
 	}
-	if strings.HasPrefix(name, "type.") {
+	if strings.HasPrefix(name, "type:") {
 		return 'T'
 	}
 	return 0
@@ -539,7 +551,7 @@ func makeSymRef(s *LSym) goobj.SymRef {
 }
 
 func (w *writer) Reloc(r *Reloc) {
-	var o goobj.Reloc
+	o := &w.tmpReloc
 	o.SetOff(r.Off)
 	o.SetSiz(r.Siz)
 	o.SetType(uint16(r.Type))
@@ -549,7 +561,7 @@ func (w *writer) Reloc(r *Reloc) {
 }
 
 func (w *writer) aux1(typ uint8, rs *LSym) {
-	var o goobj.Aux
+	o := &w.tmpAux
 	o.SetType(typ)
 	o.SetSym(makeSymRef(rs))
 	o.Write(w.Writer)
@@ -593,7 +605,12 @@ func (w *writer) Aux(s *LSym) {
 		for _, pcSym := range fn.Pcln.Pcdata {
 			w.aux1(goobj.AuxPcdata, pcSym)
 		}
-
+		if fn.WasmImportSym != nil {
+			if fn.WasmImportSym.Size == 0 {
+				panic("wasmimport aux sym must have non-zero size")
+			}
+			w.aux1(goobj.AuxWasmImport, fn.WasmImportSym)
+		}
 	}
 }
 
@@ -619,7 +636,7 @@ func (w *writer) refFlags() {
 		if flag2 == 0 {
 			return // no need to write zero flags
 		}
-		var o goobj.RefFlags
+		o := &w.tmpRefFlags
 		o.SetSym(symref)
 		o.SetFlag2(flag2)
 		o.Write(w.Writer)
@@ -645,7 +662,7 @@ func (w *writer) refNames() {
 		}
 		seen[rs] = true
 		symref := makeSymRef(rs)
-		var o goobj.RefName
+		o := &w.tmpRefName
 		o.SetSym(symref)
 		o.SetName(rs.Name, w.Writer)
 		o.Write(w.Writer)
@@ -691,6 +708,12 @@ func nAuxSym(s *LSym) int {
 			n++
 		}
 		n += len(fn.Pcln.Pcdata)
+		if fn.WasmImport != nil {
+			if fn.WasmImportSym == nil || fn.WasmImportSym.Size == 0 {
+				panic("wasmimport aux sym must exist and have non-zero size")
+			}
+			n++
+		}
 	}
 	return n
 }
@@ -698,7 +721,6 @@ func nAuxSym(s *LSym) int {
 // generate symbols for FuncInfo.
 func genFuncInfoSyms(ctxt *Link) {
 	infosyms := make([]*LSym, 0, len(ctxt.Text))
-	hashedsyms := make([]*LSym, 0, 4*len(ctxt.Text))
 	var b bytes.Buffer
 	symidx := int32(len(ctxt.defs))
 	for _, s := range ctxt.Text {
@@ -707,10 +729,11 @@ func genFuncInfoSyms(ctxt *Link) {
 			continue
 		}
 		o := goobj.FuncInfo{
-			Args:     uint32(fn.Args),
-			Locals:   uint32(fn.Locals),
-			FuncID:   fn.FuncID,
-			FuncFlag: fn.FuncFlag,
+			Args:      uint32(fn.Args),
+			Locals:    uint32(fn.Locals),
+			FuncID:    fn.FuncID,
+			FuncFlag:  fn.FuncFlag,
+			StartLine: fn.StartLine,
 		}
 		pc := &fn.Pcln
 		i := 0
@@ -722,7 +745,7 @@ func genFuncInfoSyms(ctxt *Link) {
 		sort.Slice(o.File, func(i, j int) bool { return o.File[i] < o.File[j] })
 		o.InlTree = make([]goobj.InlTreeNode, len(pc.InlTree.nodes))
 		for i, inl := range pc.InlTree.nodes {
-			f, l := getFileIndexAndLine(ctxt, inl.Pos)
+			f, l := ctxt.getFileIndexAndLine(inl.Pos)
 			o.InlTree[i] = goobj.InlTreeNode{
 				Parent:   int32(inl.Parent),
 				File:     goobj.CUFileIndex(f),
@@ -747,8 +770,8 @@ func genFuncInfoSyms(ctxt *Link) {
 		fn.FuncInfoSym = isym
 		b.Reset()
 
-		dwsyms := []*LSym{fn.dwarfRangesSym, fn.dwarfLocSym, fn.dwarfDebugLinesSym, fn.dwarfInfoSym}
-		for _, s := range dwsyms {
+		auxsyms := []*LSym{fn.dwarfRangesSym, fn.dwarfLocSym, fn.dwarfDebugLinesSym, fn.dwarfInfoSym, fn.WasmImportSym}
+		for _, s := range auxsyms {
 			if s == nil || s.Size == 0 {
 				continue
 			}
@@ -760,7 +783,6 @@ func genFuncInfoSyms(ctxt *Link) {
 		}
 	}
 	ctxt.defs = append(ctxt.defs, infosyms...)
-	ctxt.hasheddefs = append(ctxt.hasheddefs, hashedsyms...)
 }
 
 func writeAuxSymDebug(ctxt *Link, par *LSym, aux *LSym) {
